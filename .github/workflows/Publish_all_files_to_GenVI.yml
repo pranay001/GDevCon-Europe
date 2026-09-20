@@ -1,0 +1,213 @@
+# =============================================================================
+#  ██████╗ ███████╗███╗   ██╗██╗   ██╗██╗
+# ██╔════╝ ██╔════╝████╗  ██║██║   ██║██║
+# ██║  ███╗█████╗  ██╔██╗ ██║██║   ██║██║
+# ██║   ██║██╔══╝  ██║╚██╗██║╚██╗ ██╔╝██║
+# ╚██████╔╝███████╗██║ ╚████║ ╚████╔╝ ██║
+#  ╚═════╝ ╚══════╝╚═╝  ╚═══╝  ╚═══╝  ╚═╝
+#
+#  GenVI Publish — All Files
+#  Publishes EVERY git-tracked file in the repository to GenVI. Unlike the
+#  push-triggered workflow, this does not diff anything -- it enumerates the
+#  whole tree, so use it to seed a fresh GenVI project or to re-sync after
+#  GenVI and the repository have drifted apart.
+#
+#  Manually triggered only (Actions tab -> Run workflow). The branch picked
+#  in the Run workflow dialog is the branch that gets published.
+#
+#  Runs on a GitHub-hosted Windows runner. LabVIEW/LabVIEWCLI is not
+#  installed on the runner — every LabVIEW operation runs inside the
+#  soliton/labview-genvi Docker image, with the checked-out workspace
+#  bind-mounted into the container at C:\workspace.
+#
+#  Required secrets: GENVI_KEY, GHCR_PAT
+# =============================================================================
+
+name: "GenVI | Publish All Files"
+
+on:
+  workflow_dispatch:
+    inputs:
+      subdirectory:
+        description: "Limit the publish to this path (leave blank to publish the whole repository)"
+        required: false
+        type: string
+        default: ""
+      change_type:
+        description: "Change type recorded for every file in the changelog"
+        required: false
+        type: choice
+        default: added
+        options:
+          - added
+          - modified
+
+# A full publish is expensive and leaves GenVI partially updated if interrupted,
+# so let a running publish finish rather than cancelling it for a newer dispatch.
+concurrency:
+  group: genvi-publish-all-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  GENVI_DOCKER_IMAGE: 'ghcr.io/pranay001/soliton/labview-genvi:latest-windows' # LabVIEW+GenVI CLI Windows container image
+  GENVI_VI_PATH: 'C:\Program Files\National Instruments\LabVIEW 2026\vi.lib\Soliton\GenVI\GenVI_CLI.vi' # fixed path to GenVI_CLI.vi inside the container image
+
+jobs:
+
+  # ----------------------------------------------------------------------------
+  # Publish every tracked file in the repository to GenVI
+  # ----------------------------------------------------------------------------
+  publish-all:
+    name: "GenVI | Publish all files"
+    runs-on: self-hosted
+
+    # Guard against a hung LabVIEW process burning billable Windows minutes.
+    timeout-minutes: 180
+
+    steps:
+
+      # -------------------------------------------------------------------------
+      # STEP 1 — Checkout the selected branch
+      #          No history needed: this workflow enumerates the working tree
+      #          instead of diffing commits, so a shallow clone is enough.
+      # -------------------------------------------------------------------------
+      - name: Checkout branch
+        uses: actions/checkout@v4
+
+      # -------------------------------------------------------------------------
+      # STEP 2 — Enumerate every tracked file into the GenVI changelog format
+      #
+      #          git ls-files is used rather than a filesystem walk so the list
+      #          honours .gitignore and never picks up .git internals.
+      #
+      #          Paths are recorded as C:\workspace\... (the container-side
+      #          mount point) since changed_files.json is read by the CLI
+      #          running inside the container, not on the runner host.
+      # -------------------------------------------------------------------------
+      - name: Collect all tracked files
+        shell: powershell
+        env:
+          SUBDIR:      ${{ inputs.subdirectory }}
+          CHANGE_TYPE: ${{ inputs.change_type }}
+        run: |
+          $wsRoot        = "${{ github.workspace }}"
+          $containerRoot = "C:\workspace"
+          $subdir        = if ($env:SUBDIR) { $env:SUBDIR.Trim() } else { "" }
+          $changeType    = if ($env:CHANGE_TYPE) { $env:CHANGE_TYPE } else { "added" }
+
+          # core.quotePath=false keeps non-ASCII filenames readable instead of
+          # arriving as escaped octal sequences.
+          if ([string]::IsNullOrWhiteSpace($subdir)) {
+            Write-Host "Enumerating all tracked files in the repository."
+            $rawLines = & git -c core.quotePath=false ls-files
+          } else {
+            Write-Host "Enumerating tracked files under '$subdir'."
+            $rawLines = & git -c core.quotePath=false ls-files -- "$subdir"
+          }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "git ls-files failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+
+          $allItems = @()
+          foreach ($line in $rawLines) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $allItems += [PSCustomObject][ordered]@{
+              type     = $changeType
+              path     = "$containerRoot\$($line -replace '/', '\')"
+              old_path = ""
+            }
+          }
+
+          # A full publish that finds nothing means the input is wrong, not that
+          # there is no work -- fail loudly rather than silently publishing zero.
+          if ($allItems.Count -eq 0) {
+            if ([string]::IsNullOrWhiteSpace($subdir)) {
+              Write-Error "No tracked files found in the repository."
+            } else {
+              Write-Error "No tracked files found under '$subdir' -- check the subdirectory input."
+            }
+            exit 1
+          }
+
+          $outPath = "$wsRoot\changed_files.json"
+          $json = if ($allItems.Count -eq 1) {
+            "[$($allItems | ConvertTo-Json -Depth 3)]"
+          } else {
+            $allItems | ConvertTo-Json -Depth 3
+          }
+          [System.IO.File]::WriteAllText($outPath, $json, [System.Text.UTF8Encoding]::new($false))
+
+          $maxList = 200
+          Write-Host "::group::Files to publish ($($allItems.Count))"
+          $allItems | Select-Object -First $maxList | ForEach-Object {
+            Write-Host "  [$($_.type.ToUpper().PadRight(8))] $($_.path)"
+          }
+          if ($allItems.Count -gt $maxList) {
+            Write-Host "  ... and $($allItems.Count - $maxList) more (log listing capped at $maxList; all $($allItems.Count) are in changed_files.json)"
+          }
+          Write-Host "::endgroup::"
+
+      # -------------------------------------------------------------------------
+      # STEP 3 — Log in to GHCR so docker can pull the private image.
+      #          GHCR requires a CLASSIC PAT with read:packages -- the container
+      #          registry does not accept fine-grained tokens.
+      # -------------------------------------------------------------------------
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      # -------------------------------------------------------------------------
+      # STEP 4 — Pull the image up front so a registry/auth failure is reported
+      #          on its own step instead of surfacing as a GenVI publish failure.
+      # -------------------------------------------------------------------------
+      - name: Pull GenVI image
+        shell: powershell
+        run: |
+          Write-Host "Pulling $env:GENVI_DOCKER_IMAGE"
+          docker pull $env:GENVI_DOCKER_IMAGE
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to pull $env:GENVI_DOCKER_IMAGE (exit code $LASTEXITCODE)."
+            exit $LASTEXITCODE
+          }
+
+      # -------------------------------------------------------------------------
+      # STEP 5 — Publish the full changelog to GenVI in a single CLI call.
+      #          Runs via the soliton/labview-genvi Docker image, with the
+      #          workspace bind-mounted at C:\workspace.
+      #
+      #          The "false" positional argument marks this as a publish rather
+      #          than a PR review pass (the PR workflow passes "true").
+      # -------------------------------------------------------------------------
+      - name: Publish all files to GenVI
+        shell: powershell
+        env:
+          GENVI_API_KEY: ${{ secrets.GENVI_KEY }}
+        run: |
+          $changedFiles = "${{ github.workspace }}\changed_files.json"
+
+          if (-not (Test-Path $changedFiles)) {
+            Write-Error "changed_files.json not found -- the collect step did not produce a changelog."
+            exit 1
+          }
+
+          $files = Get-Content $changedFiles | ConvertFrom-Json
+          Write-Host "Publishing $(@($files).Count) file(s) to GenVI."
+
+          docker run --rm `
+            -v "${{ github.workspace }}:C:\workspace" `
+            $env:GENVI_DOCKER_IMAGE `
+            LabVIEWCLI -LogToConsole TRUE -OperationName RunVI -VIPath $env:GENVI_VI_PATH "$env:GENVI_API_KEY" "C:\workspace\changed_files.json" "true" "https://genvibeta-server.solitontech.ai/api/v1/" -Headless
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "GenVI publish failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+          Write-Host "GenVI publish completed successfully."
