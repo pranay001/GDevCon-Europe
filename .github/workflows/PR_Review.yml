@@ -1,0 +1,31 @@
+name: LabVIEW CI
+ 
+on:
+  pull_request:
+    branches: [main]
+ 
+jobs:
+  mass-compile:
+    runs-on: [self-hosted, windows, labview]
+    steps:
+      - name: Check out the PR branch
+        uses: actions/checkout@v4
+ 
+      - name: Mass compile inside a LabVIEW container
+        shell: cmd
+        run: |
+          mkdir reports
+          docker run --rm ^
+            -v "%CD%:C:\src" ^
+            ghcr.io/pranay001/soliton/labview-genvi:latest-windows ^
+            LabVIEWCLI -OperationName MassCompile ^
+                       -DirectoryToCompile "C:\src" ^
+                       -MassCompileLogFile "C:\src\reports\compile.txt" ^
+                       -Headless
+ 
+      - name: Publish the compile log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: masscompile-log
+          path: reports/compile.txt
