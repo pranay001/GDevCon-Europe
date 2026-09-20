@@ -1,0 +1,249 @@
+# =============================================================================
+#  ██████╗ ███████╗███╗   ██╗██╗   ██╗██╗
+# ██╔════╝ ██╔════╝████╗  ██║██║   ██║██║
+# ██║  ███╗█████╗  ██╔██╗ ██║██║   ██║██║
+# ██║   ██║██╔══╝  ██║╚██╗██║╚██╗ ██╔╝██║
+# ╚██████╔╝███████╗██║ ╚████║ ╚████╔╝ ██║
+#  ╚═════╝ ╚══════╝╚═╝  ╚═══╝  ╚═══╝  ╚═╝
+#
+#  GenVI Publish — Main Branch
+#  Publishes added/modified/renamed files and deletes removed files
+#  in GenVI whenever a push lands on main or master.
+#
+#  Runs on a GitHub-hosted Windows runner. LabVIEW/LabVIEWCLI is not
+#  installed on the runner — every LabVIEW operation runs inside the
+#  soliton/labview-genvi Docker image, with the checked-out workspace
+#  bind-mounted into the container at C:\workspace.
+#
+#  Required secret: GENVI_KEY
+# =============================================================================
+
+name: "GenVI | Publish to Main"
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: genvi-publish-main-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  GENVI_DOCKER_IMAGE: 'ghcr.io/pranay001/soliton/labview-genvi:latest-windows' # LabVIEW+GenVI CLI Windows container image
+  GENVI_VI_PATH: 'C:\Program Files\National Instruments\LabVIEW 2026\vi.lib\Soliton\GenVI\GenVI_CLI.vi' # fixed path to GenVI_CLI.vi inside the container image
+
+jobs:
+
+  # ----------------------------------------------------------------------------
+  # Publish changed files and delete removed files in GenVI
+  # ----------------------------------------------------------------------------
+  publish-main:
+    name: "GenVI | Sync changes (main/master)"
+    runs-on: self-hosted
+
+    steps:
+
+      # -------------------------------------------------------------------------
+      # STEP 1 — Checkout the branch
+      # -------------------------------------------------------------------------
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -------------------------------------------------------------------------
+      # STEP 2 — Collect all files changed across the entire push
+      #          Diffs github.event.before..github.sha to cover every commit
+      #          pushed at once, not just the last one.
+      #
+      #          Paths are recorded as C:\workspace\... (the container-side
+      #          mount point) since changed_files.json is read by the CLI
+      #          running inside the container, not on the runner host.
+      # -------------------------------------------------------------------------
+      - name: Collect changed files
+        shell: powershell
+        run: |
+          $wsRoot = "${{ github.workspace }}"
+          $containerRoot = "C:\workspace"
+
+          # github.event.before may be the null SHA (first push) or an unreachable SHA
+          # (force-push). Verify it is reachable before using it; fall back to HEAD~1.
+          $beforeSha = "${{ github.event.before }}"
+          $nullSha   = "0000000000000000000000000000000000000000"
+          $useBase   = $beforeSha
+          if ($beforeSha -eq $nullSha -or [string]::IsNullOrWhiteSpace($beforeSha)) {
+            $useBase = $null
+          } else {
+            $ErrorActionPreference = 'SilentlyContinue'
+            $null = & git cat-file -e "$beforeSha^{commit}" 2>&1
+            $reachable = $LASTEXITCODE -eq 0
+            $ErrorActionPreference = 'Continue'
+            if (-not $reachable) { $useBase = $null }
+          }
+          if ($null -eq $useBase) {
+            Write-Host "before SHA is null/unreachable -- diffing against HEAD~1"
+            $rawLines = & git diff --name-status HEAD~1 ${{ github.sha }} 2>&1
+          } else {
+            $rawLines = & git diff --name-status $useBase ${{ github.sha }} 2>&1
+          }
+          $allItems = @()
+
+          foreach ($line in $rawLines) {
+            if ($line -match '^([AMDRC])\d*\t(.+?)(?:\t(.+))?$') {
+              $statusChar = $Matches[1]
+              $type = switch ($statusChar) {
+                'A' { 'added' }
+                'M' { 'modified' }
+                'D' { 'removed' }
+                'R' { 'renamed' }
+                'C' { 'renamed' }
+                default { 'modified' }
+              }
+              if ($Matches[3]) { $newFile = $Matches[3]; $oldFile = $Matches[2] }
+              else             { $newFile = $Matches[2]; $oldFile = "" }
+              $oldPath = if ($oldFile) { "$containerRoot\$($oldFile -replace '/', '\')" } else { "" }
+              $allItems += [PSCustomObject][ordered]@{
+                type     = $type
+                path     = "$containerRoot\$($newFile -replace '/', '\')"
+                old_path = $oldPath
+              }
+            }
+          }
+
+          $outPath = "$wsRoot\changed_files.json"
+          $json = if ($allItems.Count -eq 1) {
+            "[$($allItems | ConvertTo-Json -Depth 3)]"
+          } else {
+            $allItems | ConvertTo-Json -Depth 3
+          }
+          [System.IO.File]::WriteAllText($outPath, $json, [System.Text.UTF8Encoding]::new($false))
+
+          Write-Host "::group::Changed Files ($($allItems.Count))"
+          $allItems | ForEach-Object {
+            if ($_.old_path) {
+              Write-Host "  [$($_.type.ToUpper().PadRight(8))] $($_.old_path) -> $($_.path)"
+            } else {
+              Write-Host "  [$($_.type.ToUpper().PadRight(8))] $($_.path)"
+            }
+          }
+          Write-Host "::endgroup::"
+
+      # -------------------------------------------------------------------------
+      # STEP 3 — Sanity-check the GHCR_PAT secret before using it.
+      #          GHCR answers 'unauthorized' both for a bad token AND for an
+      #          image path it cannot see, so confirm what the token can reach.
+      #          Note: GHCR requires a CLASSIC PAT with read:packages -- the
+      #          container registry does not accept fine-grained tokens.
+      # -------------------------------------------------------------------------
+      - name: Verify GHCR access
+        shell: powershell
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_PAT }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GHCR_TOKEN)) {
+            Write-Error "GHCR_PAT secret is empty or not set on this repository."
+            exit 1
+          }
+          Write-Host "Token length: $($env:GHCR_TOKEN.Length) (trimmed: $($env:GHCR_TOKEN.Trim().Length))"
+          Write-Host "Login user:   ${{ github.actor }}"
+
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $headers = @{
+            Authorization = "Bearer $($env:GHCR_TOKEN.Trim())"
+            Accept        = 'application/vnd.github+json'
+          }
+
+          Write-Host "::group::Token identity and scopes"
+          try {
+            $resp = Invoke-WebRequest -Uri 'https://api.github.com/user' -Headers $headers -UseBasicParsing
+            Write-Host "  authenticated as: $(($resp.Content | ConvertFrom-Json).login)"
+            Write-Host "  x-oauth-scopes:   $($resp.Headers['x-oauth-scopes'])"
+          } catch {
+            Write-Host "  identity check failed: $($_.Exception.Message)"
+          }
+          Write-Host "::endgroup::"
+
+          Write-Host "::group::Container packages visible to this token"
+          try {
+            $pkgs = Invoke-RestMethod -Uri 'https://api.github.com/user/packages?package_type=container' -Headers $headers
+            if (@($pkgs).Count -eq 0) {
+              Write-Host "  (none -- this token cannot see any container packages)"
+            } else {
+              $pkgs | ForEach-Object { Write-Host "  ghcr.io/$($_.owner.login)/$($_.name)" }
+            }
+          } catch {
+            Write-Host "  package listing failed: $($_.Exception.Message)"
+          }
+          Write-Host "::endgroup::"
+
+      # -------------------------------------------------------------------------
+      #          Log in to GHCR via the official action -- it handles credential
+      #          passing correctly, avoiding Windows PowerShell stdin/encoding
+      #          quirks with 'docker login --password-stdin'.
+      # -------------------------------------------------------------------------
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      # -------------------------------------------------------------------------
+      # STEP 4 — Pull the image up front so a registry/auth failure is reported
+      #          on its own step instead of surfacing as a GenVI sync failure.
+      # -------------------------------------------------------------------------
+      - name: Pull GenVI image
+        shell: powershell
+        run: |
+          Write-Host "Pulling $env:GENVI_DOCKER_IMAGE"
+          docker pull $env:GENVI_DOCKER_IMAGE
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to pull $env:GENVI_DOCKER_IMAGE (exit code $LASTEXITCODE)."
+            exit $LASTEXITCODE
+          }
+
+      # -------------------------------------------------------------------------
+      # STEP 5 — Sync all changes to GenVI (publish added/modified/renamed,
+      #          delete removed) in a single CLI call using the full changelog.
+      #          Runs via the soliton/labview-genvi Docker image, with the
+      #          workspace bind-mounted at C:\workspace.
+      # -------------------------------------------------------------------------
+      - name: Sync changes to GenVI
+        shell: powershell
+        env:
+          GENVI_API_KEY: ${{ secrets.GENVI_KEY }}
+        run: |
+          $changedFiles = "${{ github.workspace }}\changed_files.json"
+
+          if (-not (Test-Path $changedFiles)) {
+            Write-Host "changed_files.json not found -- skipping GenVI sync."
+            exit 0
+          }
+
+          $files = Get-Content $changedFiles | ConvertFrom-Json
+          if (@($files).Count -eq 0) {
+            Write-Host "No changes -- skipping."
+            exit 0
+          }
+
+          Write-Host "::group::Syncing to GenVI ($(@($files).Count) file(s))"
+          $files | ForEach-Object {
+            Write-Host "  [$($_.type.ToUpper().PadRight(8))] $($_.path)"
+          }
+          Write-Host "::endgroup::"
+
+          docker run --rm `
+            -v "${{ github.workspace }}:C:\workspace" `
+            $env:GENVI_DOCKER_IMAGE `
+            LabVIEWCLI -LogToConsole TRUE -OperationName RunVI -VIPath $env:GENVI_VI_PATH "$env:GENVI_API_KEY" "C:\workspace\changed_files.json" "false" "https://genvibeta-server.solitontech.ai/api/v1/" -Headless
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "GenVI sync failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+          Write-Host "GenVI sync completed successfully."
