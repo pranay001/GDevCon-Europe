@@ -6,7 +6,7 @@ on:
  
 jobs:
   mass-compile:
-    runs-on: [self-hosted, windows, labview]
+    runs-on: self-hosted
     steps:
       - name: Check out the PR branch
         uses: actions/checkout@v4
