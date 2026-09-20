@@ -1,0 +1,345 @@
+# =============================================================================
+#  ██████╗ ███████╗███╗   ██╗██╗   ██╗██╗
+# ██╔════╝ ██╔════╝████╗  ██║██║   ██║██║
+# ██║  ███╗█████╗  ██╔██╗ ██║██║   ██║██║
+# ██║   ██║██╔══╝  ██║╚██╗██║╚██╗ ██╔╝██║
+# ╚██████╔╝███████╗██║ ╚████║ ╚████╔╝ ██║
+#  ╚═════╝ ╚══════╝╚═╝  ╚═══╝  ╚═══╝  ╚═╝
+#
+#  GenVI Publish — Pull Request (diff branch)
+#  1. Publishes PR-changed files to the GenVI diff environment.
+#  2. Triggers Claude Code (via claude-code-action) to review the PR against
+#     the PR description and any linked GitHub Issues using GenVI MCP tools,
+#     then posts the review as a comment.
+#
+#  LabVIEW/LabVIEWCLI is not installed on the runner — every LabVIEW
+#  operation runs inside the soliton/labview-genvi Docker image, with the
+#  checked-out workspace bind-mounted into the container at C:\workspace.
+#
+#  Required secrets:
+#    GENVI_DIFF_KEY      — GenVI API key for the diff/staging environment
+#    GENVI_KEY           — GenVI API key for the main/production environment
+#    GHCR_PAT            — classic PAT with read:packages, to pull the image
+#    ANTHROPIC_API_KEY   — Anthropic API key for Claude Code Action
+# =============================================================================
+
+name: "GenVI | Review PR"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: genvi-publish-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read         # needed to pull the private GenVI image from GHCR
+  pull-requests: write   # needed to post the Claude review comment
+  issues: read           # needed to fetch linked issue bodies
+  id-token: write        # required by claude-code-action
+  actions: read          # required for Claude to read CI results on PRs
+
+env:
+  GENVI_DOCKER_IMAGE: 'ghcr.io/pranay001/soliton/labview-genvi:latest-windows' # LabVIEW+GenVI CLI Windows container image
+  GENVI_VI_PATH: 'C:\Program Files\National Instruments\LabVIEW 2026\vi.lib\Soliton\GenVI\GenVI_CLI.vi' # fixed path to GenVI_CLI.vi inside the container image
+
+jobs:
+
+  # ----------------------------------------------------------------------------
+  # JOB 1 — Publish PR files to GenVI diff environment
+  # ----------------------------------------------------------------------------
+  publish-pr:
+    name: "GenVI | Publish to Diff Branch"
+    runs-on: self-hosted
+
+    steps:
+
+      # -------------------------------------------------------------------------
+      # STEP 1 — Checkout the PR branch
+      # -------------------------------------------------------------------------
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -------------------------------------------------------------------------
+      # STEP 2 — Collect all files changed in this PR
+      #          Diffs PR base SHA..HEAD so every commit in the PR is included.
+      #
+      #          Paths are recorded as C:\workspace\... (the container-side
+      #          mount point) since changed_files.json is read by the CLI
+      #          running inside the container, not on the runner host.
+      # -------------------------------------------------------------------------
+      - name: Collect changed files
+        shell: powershell
+        run: |
+          $wsRoot = "${{ github.workspace }}"
+          $containerRoot = "C:\workspace"
+
+          # base.sha may be the null SHA (first push) or unreachable after a force-push.
+          # Verify it is reachable before using it; fall back to HEAD~1.
+          $baseSha = "${{ github.event.pull_request.base.sha }}"
+          $nullSha = "0000000000000000000000000000000000000000"
+          $useBase = $baseSha
+          if ($baseSha -eq $nullSha -or [string]::IsNullOrWhiteSpace($baseSha)) {
+            $useBase = $null
+          } else {
+            $ErrorActionPreference = 'SilentlyContinue'
+            $null = & git cat-file -e "$baseSha^{commit}" 2>&1
+            $reachable = $LASTEXITCODE -eq 0
+            $ErrorActionPreference = 'Continue'
+            if (-not $reachable) { $useBase = $null }
+          }
+          if ($null -eq $useBase) {
+            Write-Host "base SHA is null/unreachable -- diffing against HEAD~1"
+            $rawLines = & git diff --name-status HEAD~1 ${{ github.sha }} 2>&1
+          } else {
+            $rawLines = & git diff --name-status $useBase ${{ github.sha }} 2>&1
+          }
+          $allItems = @()
+
+          foreach ($line in $rawLines) {
+            if ($line -match '^([AMDRC])\d*\t(.+?)(?:\t(.+))?$') {
+              $statusChar = $Matches[1]
+              $type = switch ($statusChar) {
+                'A' { 'added' }
+                'M' { 'modified' }
+                'D' { 'removed' }
+                'R' { 'renamed' }
+                'C' { 'renamed' }
+                default { 'modified' }
+              }
+              if ($Matches[3]) { $newFile = $Matches[3]; $oldFile = $Matches[2] }
+              else             { $newFile = $Matches[2]; $oldFile = "" }
+              $oldPath = if ($oldFile) { "$containerRoot\$($oldFile -replace '/', '\')" } else { "" }
+              $allItems += [PSCustomObject][ordered]@{
+                type     = $type
+                path     = "$containerRoot\$($newFile -replace '/', '\')"
+                old_path = $oldPath
+              }
+            }
+          }
+
+          $outPath = "$wsRoot\changed_files.json"
+          $json = if ($allItems.Count -eq 1) {
+            "[$($allItems | ConvertTo-Json -Depth 3)]"
+          } else {
+            $allItems | ConvertTo-Json -Depth 3
+          }
+          [System.IO.File]::WriteAllText($outPath, $json, [System.Text.UTF8Encoding]::new($false))
+
+          Write-Host "::group::Changed Files ($($allItems.Count))"
+          $allItems | ForEach-Object {
+            if ($_.old_path) {
+              Write-Host "  [$($_.type.ToUpper().PadRight(8))] $($_.old_path) -> $($_.path)"
+            } else {
+              Write-Host "  [$($_.type.ToUpper().PadRight(8))] $($_.path)"
+            }
+          }
+          Write-Host "::endgroup::"
+
+      # -------------------------------------------------------------------------
+      # STEP 3 — Log in to GHCR so docker can pull the private image.
+      #          GHCR requires a CLASSIC PAT with read:packages -- the container
+      #          registry does not accept fine-grained tokens.
+      # -------------------------------------------------------------------------
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      # -------------------------------------------------------------------------
+      # STEP 4 — Pull the image up front so a registry/auth failure is reported
+      #          on its own step instead of surfacing as a GenVI sync failure.
+      # -------------------------------------------------------------------------
+      - name: Pull GenVI image
+        shell: powershell
+        run: |
+          Write-Host "Pulling $env:GENVI_DOCKER_IMAGE"
+          docker pull $env:GENVI_DOCKER_IMAGE
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to pull $env:GENVI_DOCKER_IMAGE (exit code $LASTEXITCODE)."
+            exit $LASTEXITCODE
+          }
+
+      # -------------------------------------------------------------------------
+      # STEP 5 — Sync all changes to GenVI diff environment (publish
+      #          added/modified/renamed, delete removed) in a single CLI call.
+      #          Runs via the soliton/labview-genvi Docker image, with the
+      #          workspace bind-mounted at C:\workspace.
+      #
+      #          The "true" positional argument marks this as a PR review pass
+      #          (the main/all publish workflows pass "false").
+      # -------------------------------------------------------------------------
+      - name: Sync changes to GenVI (diff)
+        shell: powershell
+        env:
+          GENVI_API_KEY: ${{ secrets.GENVI_DIFF_KEY }}
+        run: |
+          $changedFiles = "${{ github.workspace }}\changed_files.json"
+
+          if (-not (Test-Path $changedFiles)) {
+            Write-Host "changed_files.json not found -- skipping GenVI sync."
+            exit 0
+          }
+
+          $files = Get-Content $changedFiles | ConvertFrom-Json
+          if (@($files).Count -eq 0) {
+            Write-Host "No changes -- skipping."
+            exit 0
+          }
+
+          Write-Host "::group::Syncing to GenVI diff ($(@($files).Count) file(s))"
+          $files | ForEach-Object {
+            Write-Host "  [$($_.type.ToUpper().PadRight(8))] $($_.path)"
+          }
+          Write-Host "::endgroup::"
+
+          docker run --rm `
+            -v "${{ github.workspace }}:C:\workspace" `
+            $env:GENVI_DOCKER_IMAGE `
+            LabVIEWCLI -LogToConsole TRUE -OperationName RunVI -VIPath $env:GENVI_VI_PATH "$env:GENVI_API_KEY" "C:\workspace\changed_files.json" "true" "https://genvibeta-server.solitontech.ai/api/v1/" -Headless
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "GenVI sync failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+          Write-Host "GenVI sync completed successfully."
+
+  # ----------------------------------------------------------------------------
+  # JOB 2 — Claude Code review (via claude-code-action)
+  #          Uses the same model, tools, and MCP servers as claude.yml.
+  #          Reads the PR description and linked issues, queries GenVI and
+  #          GenVI diff-repo via MCP, then posts a structured review comment.
+  # ----------------------------------------------------------------------------
+  claude-review:
+    name: "GenVI | Claude Code Review"
+    runs-on: ubuntu-latest
+    needs: publish-pr
+    if: always() && (needs.publish-pr.result == 'success' || needs.publish-pr.result == 'skipped')
+
+    steps:
+
+      # -------------------------------------------------------------------------
+      # STEP 1 — Checkout (needed by claude-code-action)
+      # -------------------------------------------------------------------------
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # -------------------------------------------------------------------------
+      # STEP 2 — Build the review prompt from PR + linked issue context
+      #          Writes the prompt to GITHUB_ENV so the action can consume it.
+      # -------------------------------------------------------------------------
+      - name: Build review prompt
+        id: build_prompt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+
+          PR_TITLE=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json title -q '.title')
+          PR_BODY=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json body  -q '.body // ""')
+
+          ISSUE_NUMBERS=$(echo "$PR_BODY" | grep -oE '#[0-9]+' | tr -d '#' | sort -u)
+          ISSUE_CONTEXT=""
+          for NUM in $ISSUE_NUMBERS; do
+            ISSUE_TEXT=$(gh issue view "$NUM" --repo "$REPO" --json number,title,body \
+              -q '"Issue #\(.number): \(.title)\n\(.body // "")"' 2>/dev/null || true)
+            [ -n "$ISSUE_TEXT" ] && ISSUE_CONTEXT="$ISSUE_CONTEXT
+          ---
+          $ISSUE_TEXT"
+          done
+
+          # Write to a file; multiline strings don't survive GITHUB_ENV safely
+          cat > /tmp/review_prompt.txt <<'PROMPT_EOF'
+          Please review this pull request using the GenVI MCP tools available to you.
+
+          ## Pull Request
+          PROMPT_EOF
+
+          printf 'Title: %s\n\n' "$PR_TITLE"       >> /tmp/review_prompt.txt
+          printf 'Description:\n%s\n\n' "$PR_BODY"  >> /tmp/review_prompt.txt
+
+          if [ -n "$ISSUE_CONTEXT" ]; then
+            printf '## Linked Issues\n%s\n\n' "$ISSUE_CONTEXT" >> /tmp/review_prompt.txt
+          fi
+
+          cat >> /tmp/review_prompt.txt <<'PROMPT_EOF'
+          ## Your task
+
+          1. Use the `genvi_diff_repo` MCP server to identify and examine all VIs modified in this PR.
+             When citing what you retrieved, always say "From GenVI I found (diff) …" to make clear
+             which MCP server was queried.
+
+          2. Use the `genvi` MCP server to look up the original versions of those same VIs so you
+             can compare before/after.
+             When citing the original code, always say "From GenVI I found (main) …".
+
+          3. Based on the PR description and any linked issue requirements above, assess:
+             - **Correctness** — does the implementation address the stated goal / fix?
+             - **Code quality** — naming, structure, error handling, edge cases in LabVIEW terms.
+             - **Completeness** — are all VIs mentioned in the issue/PR description actually changed?
+             - **Overall verdict** — Approve / Request Changes / Comment with a one-sentence justification.
+
+          Format your response as GitHub-flavoured Markdown with a short executive summary
+          (2-3 sentences) followed by clearly headed sections for each point above.
+          PROMPT_EOF
+
+          # Expose path for the next step
+          echo "prompt_file=/tmp/review_prompt.txt" >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------------------------
+      # STEP 3 — Expose prompt text as an env/output variable
+      # -------------------------------------------------------------------------
+      - name: Read prompt into output
+        id: prompt_text
+        run: |
+          CONTENT=$(cat /tmp/review_prompt.txt)
+          # Write as a multiline GitHub Actions output
+          {
+            echo "text<<PROMPT_DELIM"
+            echo "$CONTENT"
+            echo "PROMPT_DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------------------------
+      # STEP 4 — Run Claude Code review via claude-code-action
+      #          Same model, allowedTools, and MCP config as claude.yml
+      # -------------------------------------------------------------------------
+      - name: Run Claude Code review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: ${{ steps.prompt_text.outputs.text }}
+          track_progress: true
+          use_sticky_comment: true
+          claude_args: |
+            --model claude-sonnet-4-6
+            --allowedTools Bash,Read,Glob,Grep,mcp__genvi__get_project_structure,mcp__genvi__list_entities_by_type,mcp__genvi__get_entity_details,mcp__genvi__get_entity_raw,mcp__genvi__find_entity,mcp__genvi__search_summaries,mcp__genvi__get_call_chain,mcp__genvi__get_class_hierarchy,mcp__genvi__get_schema,mcp__genvi__get_stats,mcp__genvi__execute_query,mcp__genvi_diff_repo__get_project_structure,mcp__genvi_diff_repo__list_entities_by_type,mcp__genvi_diff_repo__get_entity_details,mcp__genvi_diff_repo__get_entity_raw,mcp__genvi_diff_repo__find_entity,mcp__genvi_diff_repo__search_summaries,mcp__genvi_diff_repo__get_call_chain,mcp__genvi_diff_repo__get_class_hierarchy,mcp__genvi_diff_repo__get_schema,mcp__genvi_diff_repo__get_stats,mcp__genvi_diff_repo__execute_query
+            --system-prompt "You are a LabVIEW code reviewer with access to two GenVI MCP servers.
+            (1) 'genvi' — the full codebase on the main branch, representing the actual production code where the issue exists;
+            (2) 'genvi_diff_repo' — contains only the modified and newly added labview files from a PR that was raised to fix the reported issue.
+
+            Go through the following steps to review the PR:
+            1. Use 'genvi_diff_repo' to fetch the modified or added labview files in the PR branch. fetch only the VIs and labview files that has raw.
+            2. Use 'genvi' to fetch the original versions of those same VIs from the main branch.
+            3. fetch the PR description and any linked issues to understand the requirements. also look into the solution recommended by claude in the previous review comment if any.
+            4. Compare the before/after VIs and assess whether the PR changes correctly address the requirements, make sure the solution recommended by claude in the previous review comment is implemented correctly.
+                - When reviewing the test procedures, make sure the values configured to the instrument is same as mentioned in the methodology provided by the user/ issue.
+                - highlight the key differences and similarities between the methodology and the implemented code.
+                - make sure to review all the files to check if the intent is met. incase of methodology, mainly verify the vi which performs the test.
+            5. Provide a clear verdict (Approve / Request Changes / Comment) with a one-sentence justification. Format your response as GitHub-flavoured Markdown with a short executive summary (2-3 sentences) followed by clearly headed sections for each assessment point.
+                - do not provide any xml snippets in the generated report.
+
+            When citing what you retrieved, always say 'From GenVI I found (diff) …' for the PR branch and 'From GenVI I found (main) …' for the main branch. This makes it unambiguous to the reader which MCP server was the source of each observation. mention that you are using GenVI to investigate the PR."
+            --mcp-config '{"mcpServers":{"genvi":{"type":"http","url":"https://genvibeta-mcp.solitontech.ai/mcp","headers":{"Authorization":"${{ secrets.GENVI_KEY }}"}},"genvi_diff_repo":{"type":"http","url":"https://genvibeta-mcp.solitontech.ai/mcp","headers":{"Authorization":"${{ secrets.GENVI_DIFF_KEY }}"}}}}'
+          additional_permissions: |
+            actions: read
